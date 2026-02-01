@@ -1,0 +1,139 @@
+#!/usr/bin/expect -f
+
+# --- KONFIGURASI ---
+set timeout 60
+set loop_interval 600   
+set input_delay 1
+set start_cmd "python3 main.py"
+
+# Jumlah putaran sebelum aplikasi di-restart
+set max_loops 1         
+
+match_max 100000
+
+# --- FUNGSI PROSEDUR (TIDAK BERUBAH) ---
+
+proc send_input {text} {
+    global input_delay
+    sleep $input_delay 
+    send $text
+}
+
+proc wait_for {pattern err_msg} {
+    expect {
+        -re $pattern {}
+        timeout {
+            send_user "\n\[ERROR\] $err_msg\n"
+            return -code error "Timeout"
+        }
+        eof {
+            send_user "\n\[ERROR\] Aplikasi berhenti tiba-tiba (EOF).\n"
+            return -code error "EOF"
+        }
+    }
+}
+
+proc redeem_package {pkg_number jumlah_enter_tambahan} {
+    send_user "\n\[INFO\] Memproses Paket No. $pkg_number ...\n"
+    
+    wait_for "Pilih paket \\(nomor\\):" "Timeout daftar paket"
+    send_input "$pkg_number\r"
+
+    wait_for "Pilihan:" "Timeout opsi paket"
+    send_input "B\r"
+
+    expect {
+        -re "Enter" {}
+        timeout { send_user "\n\[ERROR\] Prompt Enter tidak muncul\n"; return -code error }
+    }
+
+    for {set i 0} {$i < $jumlah_enter_tambahan} {incr i} {
+        send_user "\[INFO\] Enter tambahan ([expr $i + 1])...\n"
+        send_input "\r"
+    }
+
+    expect {
+        -re "Paket Tersedia|Pilih paket" {}
+        timeout { send_user "\n\[ERROR\] Gagal kembali ke menu\n"; return -code error }
+    }
+}
+
+# --- EKSEKUSI UTAMA (RESTART LOGIC) ---
+
+# Loop Luar (Infinite): Untuk me-restart aplikasi
+while {1} {
+    
+    send_user "\n=========================================="
+    send_user "\n\[SYSTEM\] MEMULAI APLIKASI DARI AWAL"
+    send_user "\n==========================================\n"
+
+    # 1. Jalankan Aplikasi
+    if {[catch {spawn bash -lc "$start_cmd"} result]} {
+        send_user "\n\[FATAL\] Gagal spawn aplikasi: $result\n"
+        sleep 10
+        continue
+    }
+
+    # Tangkap error logic di dalam blok ini agar bisa di-restart
+    if {[catch {
+        
+        # 2. Navigasi Awal (14 -> n -> A1)
+        send_user "\n\[START\] Login & Navigasi...\n"
+        wait_for "Pilih menu:" "Main menu tidak muncul"
+        send_input "14\r"
+
+        wait_for "Is enterprise\\? \\(y/n\\):" "Enterprise prompt tidak muncul"
+        send_input "n\r"
+
+        wait_for "Enter your choice" "Pilihan A1 tidak muncul"
+        send_input "A1\r"
+
+        send_user "\n\[READY\] Masuk ke Loop Redeem...\n"
+
+        # 3. Loop Dalam (Dibatasi 1 Kali Redeem sebelum restart)
+        for {set k 1} {$k <= $max_loops} {incr k} {
+            set timestamp [clock format [clock seconds] -format "%H:%M:%S"]
+            send_user "\n------------------------------------------"
+            send_user "\n\[REDEEM\] Siklus Redeem (Hanya Paket 2) Dimulai (Pukul $timestamp)"
+            send_user "\n------------------------------------------\n"
+
+            # --- BAGIAN YANG DIUBAH ---
+            # Fokus HANYA nomor 2. Nomor 1 dan 3 dinonaktifkan (di-comment).
+            
+            # redeem_package 1 1  ;# <--- Dinonaktifkan
+            redeem_package 2 1    ;# <--- AKTIF (Hanya Nomor 2)
+            # redeem_package 3 1  ;# <--- Dinonaktifkan
+            
+            # --------------------------
+
+            # Waktu jeda (Sleep) dengan Hitungan Mundur (Countdown)
+            send_user "\n\[SLEEP\] Redeem Selesai. Jeda $loop_interval detik (10 Menit) dimulai:\n"
+            
+            # ⬇️ START COUNTDOWN ⬇️
+            set seconds $loop_interval
+            while {$seconds > 0} {
+                send_user "\r\[COUNTDOWN\] Sisa Waktu: $seconds detik   "
+                flush stdout
+                sleep 1
+                incr seconds -1
+            }
+            send_user "\n\[COUNTDOWN\] Jeda Selesai. Mempersiapkan Restart.\n"
+            # ⬆️ END COUNTDOWN ⬆️
+        }
+        send_user "\n\[INFO\] Siklus jeda selesai.\n"
+
+    } err_msg]} {
+        # Jika terjadi error (timeout/eof) selama redeem/jeda, masuk kesini
+        send_user "\n\[WARNING\] Terjadi kesalahan: $err_msg"
+        send_user "\n\[SYSTEM\] Melakukan restart paksa...\n"
+    }
+
+    # 4. Matikan Aplikasi dan Restart
+    send_user "\n\[STOP\] Menutup aplikasi & membersihkan sesi...\n"
+    
+    close
+    wait
+    
+    # Jeda sebentar sebelum memulai kembali (agar stabil)
+    sleep 5
+}
