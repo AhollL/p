@@ -4,6 +4,9 @@
 #   Support : Debian 11 / 12 | Ubuntu 20.04 / 22.04 (AMD64)
 #   Installer: github.com/zahidbd2/udp-zivpn (zi.sh)
 #   Creator  : zahidbd2  |  Panel by PowerMX
+#   v1.1 — Bug fixes: UFW/iptables conflict, FORWARD chain,
+#          extend_expired read order, username validation,
+#          iptables quota accounting, UDP IP-limit, mktemp
 # ================================================================
 
 # ── Warna ────────────────────────────────────────────────────
@@ -79,6 +82,20 @@ install_shortcut() {
     fi
 }
 
+# ── Validasi username ─────────────────────────────────────────
+validate_username() {
+    local uname=$1
+    if [[ ! "$uname" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]*$ ]]; then
+        echo -e "  ${RED}Username hanya boleh: huruf, angka, underscore, dash!${NC}"
+        return 1
+    fi
+    if [[ ${#uname} -lt 2 || ${#uname} -gt 32 ]]; then
+        echo -e "  ${RED}Username harus 2-32 karakter!${NC}"
+        return 1
+    fi
+    return 0
+}
+
 # ════════════════════════════════════════════════════════════
 #  ENFORCEMENT ENGINE
 #  1. zivpn-expire-check  — cek expired tiap 5 menit
@@ -140,7 +157,12 @@ LOG="/var/log/zivpn-enforce.log"
 while IFS='|' read -r uname pass expire quota maxip acctype created used; do
     [[ -z "\$uname" ]] && continue
     [[ "\$maxip" == "0" ]] && continue
-    active_ips=\$(who 2>/dev/null | grep "^\${uname} " | awk '{print \$5}' | tr -d '()' | sort -u | wc -l)
+    # SSH sessions
+    ssh_ips=\$(who 2>/dev/null | grep "^\${uname} " | awk '{print \$5}' | tr -d '()' | sort -u)
+    # UDP VPN connections (port 5667) - count unique source IPs (peer address is field $5)
+    udp_ips=\$(ss -unp 2>/dev/null | grep ":5667" | awk '{split(\$5,a,":");print a[1]}' | sort -u)
+    # Combine unique IPs
+    active_ips=\$(echo -e "\${ssh_ips}\n\${udp_ips}" | grep -v '^$' | sort -u | wc -l)
     if [[ \$active_ips -gt \$maxip ]]; then
         excess=\$(( active_ips - maxip ))
         old_pids=\$(who 2>/dev/null | grep "^\${uname} " | awk '{print \$2}' | while read pts; do
@@ -158,7 +180,7 @@ IPEOF
     # ── 3. Script cek kuota ──────────────────────────────
     cat > "$ENFORCE_QUOTA" <<QTEOF
 #!/bin/bash
-# zivpn-quota-check — cek kuota tiap 5 menit
+# zivpn-quota-check — cek kuota tiap 5 menit (iptables accounting)
 USER_DB="$USER_DB"
 CONFIG_JSON="$CONFIG_JSON"
 LOG="/var/log/zivpn-enforce.log"
@@ -166,25 +188,38 @@ LOG="/var/log/zivpn-enforce.log"
 while IFS='|' read -r uname pass expire quota maxip acctype created used; do
     [[ -z "\$uname" ]] && continue
     [[ "\$quota" == "0" ]] && continue
-    quota_bytes=\$(( quota * 1024 * 1024 * 1024 ))
-    used_bytes=0
-    for pid in \$(pgrep -u "\$uname" 2>/dev/null); do
-        [[ -r "/proc/\$pid/io" ]] || continue
-        rb=\$(grep "^read_bytes"  /proc/\$pid/io 2>/dev/null | awk '{print \$2}')
-        wb=\$(grep "^write_bytes" /proc/\$pid/io 2>/dev/null | awk '{print \$2}')
-        used_bytes=\$(( used_bytes + \${rb:-0} + \${wb:-0} ))
-    done
-    used_gb_now=\$(( used_bytes / 1024 / 1024 / 1024 ))
-    [[ \$used_gb_now -gt 0 ]] && \
-        awk -F'|' -v u="\$uname" -v ug="\$used_gb_now" 'BEGIN{OFS="|"} \$1==u{\$8=ug}1' \
-            "\$USER_DB" > /tmp/_zdb_q && mv /tmp/_zdb_q "\$USER_DB"
-    if [[ \$used_bytes -gt \$quota_bytes ]] && [[ \$quota_bytes -gt 0 ]]; then
+    # Buat iptables accounting chain jika belum ada
+    chain="ZIVPN_\${uname}"
+    if ! iptables -L "\$chain" -n &>/dev/null; then
+        iptables -N "\$chain" 2>/dev/null
+        iptables -A "\$chain" -j RETURN
+        # Tambah ke OUTPUT untuk user ini (-m owner hanya berlaku di OUTPUT chain)
+        if id "\$uname" &>/dev/null; then
+            iptables -I OUTPUT -m owner --uid-owner "\$(id -u "\$uname")" -j "\$chain" 2>/dev/null
+        fi
+    fi
+    # Baca bytes dari iptables chain dan reset counter
+    session_bytes=\$(iptables -L "\$chain" -nvx 2>/dev/null | awk 'NR>2{sum+=\$2}END{print sum+0}')
+    iptables -Z "\$chain" 2>/dev/null
+    # Hitung total: used_gb dari DB (field $8) + session bytes dikonversi ke GB
+    used_gb=\${used:-0}
+    session_gb=\$(( session_bytes / 1024 / 1024 / 1024 ))
+    new_used=\$(( used_gb + session_gb ))
+    # Update used di DB jika ada perubahan
+    if [[ \$new_used -gt \$used_gb ]]; then
+        tmpdb=\$(mktemp)
+        awk -F'|' -v u="\$uname" -v nu="\$new_used" 'BEGIN{OFS="|"} \$1==u{\$8=nu}1' \
+            "\$USER_DB" > "\$tmpdb" && mv "\$tmpdb" "\$USER_DB"
+    fi
+    # Cek apakah kuota terlampaui
+    quota_gb=\$quota
+    if [[ \$new_used -ge \$quota_gb ]] && [[ \$quota_gb -gt 0 ]]; then
         if id "\$uname" &>/dev/null; then
             pkill -u "\$uname" 2>/dev/null; usermod -L "\$uname" 2>/dev/null
-            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] QUOTA EXCEEDED: \$uname (\${quota}GB)" >> "\$LOG"
+            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] QUOTA EXCEEDED: \$uname (\${quota_gb}GB used:\${new_used}GB)" >> "\$LOG"
         fi
         if [[ -f "\$CONFIG_JSON" ]]; then
-            python3 - <<PYEOF 2>/dev/null
+            python3 -c "
 import json
 with open('\$CONFIG_JSON') as f: c=json.load(f)
 pw=c.get('auth',{}).get('config',[])
@@ -192,7 +227,7 @@ if '\$pass' in pw: pw.remove('\$pass')
 if not pw: pw.append('zi')
 c['auth']['config']=pw
 with open('\$CONFIG_JSON','w') as f: json.dump(c,f,indent=2)
-PYEOF
+" 2>/dev/null
             systemctl restart zivpn.service 2>/dev/null
         fi
     fi
@@ -252,7 +287,6 @@ echo "[Anti-DDoS] Memasang rules pada interface: \$IFACE"
 
 # ── Flush chain INPUT saja, jangan flush NAT (ZIVPN forwarding) ──
 \$IPT -F INPUT
-\$IPT -F FORWARD
 
 # ── 1. Izinkan loopback ──────────────────────────────────────────
 \$IPT -A INPUT -i lo -j ACCEPT
@@ -307,7 +341,8 @@ echo "[Anti-DDoS] Memasang rules pada interface: \$IFACE"
 
 # ── 13. Policy INPUT DROP untuk sisa yang tidak cocok ────────────
 \$IPT -P INPUT DROP
-\$IPT -P FORWARD DROP
+# FORWARD harus ACCEPT agar ZIVPN NAT PREROUTING tetap bekerja
+\$IPT -P FORWARD ACCEPT
 \$IPT -P OUTPUT ACCEPT
 
 # ── 14. Simpan rules ──────────────────────────────────────────────
@@ -433,7 +468,7 @@ show_banner() {
     fi
 
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${WHITE}${BOLD}        ZIVPN UDP Panel CLI  v1.0                    ${NC}${CYAN}║${NC}"
+    echo -e "${CYAN}║${WHITE}${BOLD}        ZIVPN UDP Panel CLI  v1.1                    ${NC}${CYAN}║${NC}"
     echo -e "${CYAN}║${YELLOW}    Debian 11/12  |  Ubuntu 20.04/22.04  [AMD64]     ${NC}${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     printf  "${CYAN}║${NC}  %-12s: ${WHITE}%-39s${CYAN}║${NC}\n" "IP Server"   "$ip"
@@ -586,7 +621,7 @@ SVCEOF
     save_server_conf "$input_host" "$input_isp"
     echo -e "  ${GREEN}      ✓ Host: ${input_host} | ISP: ${input_isp}${NC}"
 
-    # ── [7/8] Password awal + enable + UFW/iptables ─────
+    # ── [7/8] Password awal + enable + iptables ─────────
     echo -e "  ${YELLOW}[7/8]${NC} Konfigurasi password & port..."
     echo ""
     read -rp "  Password UDP (pisah koma, Enter='zi'): " input_config
@@ -603,18 +638,12 @@ SVCEOF
         done
     fi
 
-    # UFW — allow port ZIVPN dulu SEBELUM anti-DDoS aktif
-    if command -v ufw &>/dev/null; then
-        ufw allow 22/tcp        >/dev/null 2>&1
-        ufw allow 5667/udp      >/dev/null 2>&1
-        ufw allow 6000:19999/udp >/dev/null 2>&1
-        ufw --force enable      >/dev/null 2>&1
-    fi
-
     systemctl enable zivpn.service >/dev/null 2>&1
     systemctl start  zivpn.service
 
-    # iptables PREROUTING forwarding (zi.sh) — setelah ufw allow
+    # Nonaktifkan UFW agar tidak konflik dengan iptables rules
+    command -v ufw &>/dev/null && ufw disable >/dev/null 2>&1
+    # iptables PREROUTING forwarding (zi.sh)
     local iface
     iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
     iptables -t nat -A PREROUTING -i "$iface" -p udp --dport 6000:19999 \
@@ -659,6 +688,7 @@ create_account() {
     while true; do
         read -rp "  Username          : " username
         [[ -z "$username" ]] && echo -e "  ${RED}Username tidak boleh kosong!${NC}" && continue
+        validate_username "$username" || continue
         id "$username" &>/dev/null && echo -e "  ${RED}User sistem '${username}' sudah ada!${NC}" && continue
         grep -q "^${username}|" "$USER_DB" 2>/dev/null && echo -e "  ${RED}Sudah terdaftar di panel!${NC}" && continue
         break
@@ -799,6 +829,7 @@ detail_user() {
     fi
 
     read -rp "  Masukkan username : " username
+    validate_username "$username" || { read -rp "  Tekan Enter untuk kembali..."; return; }
     local user_line; user_line=$(grep "^${username}|" "$USER_DB")
     if [[ -z "$user_line" ]]; then
         echo -e "\n  ${RED}User '${username}' tidak ditemukan!${NC}\n"
@@ -859,16 +890,18 @@ _extend_expired() {
     local username=$1
     read -rp "  Tambah berapa hari? : " add_days
     [[ ! "$add_days" =~ ^[0-9]+$ ]] && echo -e "  ${RED}Input tidak valid!${NC}" && return
-    local cur; cur=$(grep "^${username}|" "$USER_DB" | cut -d'|' -f3)
+    local cur pass acctype
+    cur=$(grep "^${username}|" "$USER_DB" | cut -d'|' -f3)
+    pass=$(grep "^${username}|" "$USER_DB" | cut -d'|' -f2)
+    acctype=$(grep "^${username}|" "$USER_DB" | cut -d'|' -f6)
     local new_exp; new_exp=$(date -d "${cur} +${add_days} days" +"%Y-%m-%d")
+    local tmpdb; tmpdb=$(mktemp)
     awk -F'|' -v u="$username" -v ne="$new_exp" 'BEGIN{OFS="|"} $1==u{$3=ne}1' \
-        "$USER_DB" > /tmp/_zdb && mv /tmp/_zdb "$USER_DB"
+        "$USER_DB" > "$tmpdb" && mv "$tmpdb" "$USER_DB"
     # Unlock user jika sebelumnya di-lock karena expired
     usermod -U "$username" 2>/dev/null
     chage -E "$new_exp" "$username" &>/dev/null
     # Tambah kembali password ke ZIVPN jika UDP
-    local pass; pass=$(grep "^${username}|" "$USER_DB" | cut -d'|' -f2)
-    local acctype; acctype=$(grep "^${username}|" "$USER_DB" | cut -d'|' -f6)
     if [[ "$acctype" != "SSH Only" ]] && [[ -f "$CONFIG_JSON" ]]; then
         python3 - <<PYEOF 2>/dev/null
 import json
@@ -889,8 +922,9 @@ _change_password() {
     read -rsp "  Password baru : " new_pass; echo ""
     [[ -z "$new_pass" ]] && echo -e "  ${RED}Password kosong!${NC}" && return
     echo "${username}:${new_pass}" | chpasswd 2>/dev/null
+    local tmpdb; tmpdb=$(mktemp)
     awk -F'|' -v u="$username" -v np="$new_pass" 'BEGIN{OFS="|"} $1==u{$2=np}1' \
-        "$USER_DB" > /tmp/_zdb && mv /tmp/_zdb "$USER_DB"
+        "$USER_DB" > "$tmpdb" && mv "$tmpdb" "$USER_DB"
     if [[ -f "$CONFIG_JSON" ]]; then
         python3 - <<PYEOF 2>/dev/null
 import json
@@ -911,8 +945,9 @@ _change_quota() {
     local username=$1
     read -rp "  Limit kuota baru GB (0=unlimited) : " nq
     [[ ! "$nq" =~ ^[0-9]+$ ]] && echo -e "  ${RED}Input tidak valid!${NC}" && return
+    local tmpdb; tmpdb=$(mktemp)
     awk -F'|' -v u="$username" -v nq="$nq" 'BEGIN{OFS="|"} $1==u{$4=nq}1' \
-        "$USER_DB" > /tmp/_zdb && mv /tmp/_zdb "$USER_DB"
+        "$USER_DB" > "$tmpdb" && mv "$tmpdb" "$USER_DB"
     local lbl; [[ "$nq" -eq 0 ]] && lbl="Unlimited" || lbl="${nq} GB"
     echo -e "\n  ${GREEN}✓ Limit kuota: ${lbl}${NC}\n"
     read -rp "  Tekan Enter untuk kembali..."
@@ -922,8 +957,9 @@ _change_maxip() {
     local username=$1
     read -rp "  Limit IP baru (0=unlimited) : " ni
     [[ ! "$ni" =~ ^[0-9]+$ ]] && echo -e "  ${RED}Input tidak valid!${NC}" && return
+    local tmpdb; tmpdb=$(mktemp)
     awk -F'|' -v u="$username" -v ni="$ni" 'BEGIN{OFS="|"} $1==u{$5=ni}1' \
-        "$USER_DB" > /tmp/_zdb && mv /tmp/_zdb "$USER_DB"
+        "$USER_DB" > "$tmpdb" && mv "$tmpdb" "$USER_DB"
     _write_pam_limit "$username" "$ni"
     local lbl; [[ "$ni" -eq 0 ]] && lbl="Unlimited" || lbl="${ni} device"
     echo -e "\n  ${GREEN}✓ Limit IP: ${lbl} (PAM + daemon aktif)${NC}\n"
@@ -952,6 +988,7 @@ delete_account() {
     echo ""
 
     read -rp "  Username yang akan dihapus : " username
+    validate_username "$username" || { read -rp "  Tekan Enter untuk kembali..."; return; }
     local user_line; user_line=$(grep "^${username}|" "$USER_DB")
     if [[ -z "$user_line" ]]; then
         echo -e "\n  ${RED}User '${username}' tidak ditemukan!${NC}\n"
@@ -983,7 +1020,8 @@ PYEOF
         systemctl restart zivpn.service &>/dev/null
     fi
 
-    sed -i "/^${username}|/d" "$USER_DB"
+    local tmpdb; tmpdb=$(mktemp)
+    awk -F'|' -v u="$username" '$1!=u' "$USER_DB" > "$tmpdb" && mv "$tmpdb" "$USER_DB"
     echo -e "\n  ${GREEN}✓ Akun '${username}' berhasil dihapus!${NC}\n"
     read -rp "  Tekan Enter untuk kembali ke menu..."
 }
